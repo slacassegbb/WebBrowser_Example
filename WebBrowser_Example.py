@@ -89,6 +89,160 @@ class MemoryEvent(BaseModel):
     path: Optional[str] = None
 
 # -------------------------
+# HighLevelAgent
+# -------------------------
+class HighLevelAgent:
+    """
+    Orchestrates the overall workflow:
+    - Generates planning tasks.
+    - Uses MediumLevelAgent to convert tasks to UI actions.
+    - Invokes LowLevelAgent to execute actions and evaluate outcomes.
+    If MediumLevelAgent returns an action with 'change_subtask', a new planning task is generated.
+    """
+    INITIAL_PROMPT_TEMPLATE = (
+        "User goal: '{user_goal}'.\n"
+        "Based on the current webpage screenshot and context, generate the initial planning task to progress toward the goal. "
+        "Return a JSON object matching the PlanningTask model."
+    )
+    NEXT_PROMPT_TEMPLATE = (
+        "User goal: '{user_goal}'.\n"
+        "Previous observation: '{observation}'.\n"
+        "Memory (events): {memory}.\n"
+        "Generate the next planning task to overcome any issues and progress toward the goal. "
+        "Return a JSON object matching the PlanningTask model."
+    )
+
+    def __init__(self, medium_agent: MediumLevelAgent, low_agent: LowLevelAgent, user_goal: str, memory: List[MemoryEvent]):
+        self.medium_agent = medium_agent
+        self.low_agent = low_agent
+        self.user_goal = user_goal
+        self.memory = memory
+
+    def generate_task(self, prompt_template: str, extra_info: Optional[str] = None) -> PlanningTask:
+        """
+        Generate a planning task via an LLM call.
+        """
+        memory_str = json.dumps([e.dict() for e in self.memory])
+        prompt = prompt_template.format(
+            user_goal=self.user_goal,
+            observation=extra_info or "",
+            memory=memory_str
+        )
+        messages = [
+            {"role": "system", "content": "You are a planner agent that creates a structured plan to achieve the user’s goal by determining tasks and their order. It assigns tasks to the right agents to ensure effective goal completion"},
+            {"role": "user", "content": prompt}
+        ]
+        try:
+            completion = openai.beta.chat.completions.parse(
+                model="GPT4o",
+                messages=messages,
+                response_format=PlanningTask
+            )
+            task: PlanningTask = completion.choices[0].message.parsed
+            self.memory.append(MemoryEvent(
+                timestamp=time.time(),
+                agent="HighLevelAgent",
+                event="Generated planning task",
+                task_id=task.id,
+                ui_action=task.dict()
+            ))
+            print("HighLevelAgent: Generated task:", task)
+            return task
+        except Exception as e:
+            print("HighLevelAgent: Error generating task:", e)
+            self.memory.append(MemoryEvent(
+                timestamp=time.time(),
+                agent="HighLevelAgent",
+                event="Task generation error",
+                error=str(e)
+            ))
+            return PlanningTask(
+                id="fallback",
+                description="Perform a default UI action to progress toward the goal.",
+                agent_type="planner"
+            )
+
+    def run(self) -> None:
+        """
+        Main orchestration loop.
+        """
+        # Capture an initial screenshot for context.
+        init_screenshot = "screenshots/initial.png"
+        self.low_agent.capture_screenshot(init_screenshot)
+
+        # Generate the initial planning task.
+        current_task = self.generate_task(self.INITIAL_PROMPT_TEMPLATE)
+
+        while True:
+            print(f"HighLevelAgent: Executing task: {current_task.description}")
+            current_task.status = TaskStatus.in_progress
+
+            # Capture a "before" screenshot.
+            pre_screenshot_path = f"screenshots/{current_task.id}_before.png"
+            self.low_agent.capture_screenshot(pre_screenshot_path)
+
+            # Translate the planning task to a concrete UI action.
+            ui_action = self.medium_agent.run(current_task)
+            if ui_action is None or ui_action.action == "change_subtask":
+                error_info = "No appropriate UI element found; changing subtask."
+                self.memory.append(MemoryEvent(
+                    timestamp=time.time(),
+                    agent="HighLevelAgent",
+                    event="Translation failure/change_subtask",
+                    task_id=current_task.id,
+                    error=error_info
+                ))
+                current_task = self.generate_task(self.NEXT_PROMPT_TEMPLATE, error_info)
+                continue
+
+            # Execute the UI action.
+            execution_result = self.low_agent.run(ui_action)
+            if not execution_result.get("success"):
+                error_info = execution_result.get("error_message", "Unknown execution error.")
+                self.memory.append(MemoryEvent(
+                    timestamp=time.time(),
+                    agent="HighLevelAgent",
+                    event="Execution error",
+                    task_id=current_task.id,
+                    error=error_info
+                ))
+                current_task = self.generate_task(self.NEXT_PROMPT_TEMPLATE, error_info)
+                continue
+
+            # Capture an "after" screenshot.
+            post_screenshot_path = f"screenshots/{current_task.id}_after.png"
+            self.low_agent.capture_screenshot(post_screenshot_path)
+
+            # Evaluate the execution using both screenshots.
+            recommendation = self.low_agent.evaluate_execution(current_task, pre_screenshot_path, post_screenshot_path, self.user_goal)
+            print("HighLevelAgent Observation:", recommendation.observation)
+            self.memory.append(MemoryEvent(
+                timestamp=time.time(),
+                agent="HighLevelAgent",
+                event="Evaluation completed",
+                task_id=current_task.id,
+                observation=recommendation.observation
+            ))
+
+            # Check if the goal is complete.
+            if recommendation.goal_complete:
+                self.memory.append(MemoryEvent(
+                    timestamp=time.time(),
+                    agent="HighLevelAgent",
+                    event="Goal achieved",
+                    task_id=current_task.id
+                ))
+                print("HighLevelAgent: Goal achieved!")
+                break
+
+            # Use any new planning task from the recommendation; otherwise, generate a new task.
+            if recommendation.new_task:
+                current_task = recommendation.new_task
+            else:
+                current_task = self.generate_task(self.NEXT_PROMPT_TEMPLATE, recommendation.observation)
+
+        print("HighLevelAgent: Execution complete.")
+# -------------------------
 # MediumLevelAgent
 # -------------------------
 class MediumLevelAgent:
@@ -384,161 +538,6 @@ class LowLevelAgent:
         Execute the given UI action.
         """
         return self.execute(action)
-
-# -------------------------
-# HighLevelAgent
-# -------------------------
-class HighLevelAgent:
-    """
-    Orchestrates the overall workflow:
-    - Generates planning tasks.
-    - Uses MediumLevelAgent to convert tasks to UI actions.
-    - Invokes LowLevelAgent to execute actions and evaluate outcomes.
-    If MediumLevelAgent returns an action with 'change_subtask', a new planning task is generated.
-    """
-    INITIAL_PROMPT_TEMPLATE = (
-        "User goal: '{user_goal}'.\n"
-        "Based on the current webpage screenshot and context, generate the initial planning task to progress toward the goal. "
-        "Return a JSON object matching the PlanningTask model."
-    )
-    NEXT_PROMPT_TEMPLATE = (
-        "User goal: '{user_goal}'.\n"
-        "Previous observation: '{observation}'.\n"
-        "Memory (events): {memory}.\n"
-        "Generate the next planning task to overcome any issues and progress toward the goal. "
-        "Return a JSON object matching the PlanningTask model."
-    )
-
-    def __init__(self, medium_agent: MediumLevelAgent, low_agent: LowLevelAgent, user_goal: str, memory: List[MemoryEvent]):
-        self.medium_agent = medium_agent
-        self.low_agent = low_agent
-        self.user_goal = user_goal
-        self.memory = memory
-
-    def generate_task(self, prompt_template: str, extra_info: Optional[str] = None) -> PlanningTask:
-        """
-        Generate a planning task via an LLM call.
-        """
-        memory_str = json.dumps([e.dict() for e in self.memory])
-        prompt = prompt_template.format(
-            user_goal=self.user_goal,
-            observation=extra_info or "",
-            memory=memory_str
-        )
-        messages = [
-            {"role": "system", "content": "You are a planner agent that creates a structured plan to achieve the user’s goal by determining tasks and their order. It assigns tasks to the right agents to ensure effective goal completion"},
-            {"role": "user", "content": prompt}
-        ]
-        try:
-            completion = openai.beta.chat.completions.parse(
-                model="GPT4o",
-                messages=messages,
-                response_format=PlanningTask
-            )
-            task: PlanningTask = completion.choices[0].message.parsed
-            self.memory.append(MemoryEvent(
-                timestamp=time.time(),
-                agent="HighLevelAgent",
-                event="Generated planning task",
-                task_id=task.id,
-                ui_action=task.dict()
-            ))
-            print("HighLevelAgent: Generated task:", task)
-            return task
-        except Exception as e:
-            print("HighLevelAgent: Error generating task:", e)
-            self.memory.append(MemoryEvent(
-                timestamp=time.time(),
-                agent="HighLevelAgent",
-                event="Task generation error",
-                error=str(e)
-            ))
-            return PlanningTask(
-                id="fallback",
-                description="Perform a default UI action to progress toward the goal.",
-                agent_type="planner"
-            )
-
-    def run(self) -> None:
-        """
-        Main orchestration loop.
-        """
-        # Capture an initial screenshot for context.
-        init_screenshot = "screenshots/initial.png"
-        self.low_agent.capture_screenshot(init_screenshot)
-
-        # Generate the initial planning task.
-        current_task = self.generate_task(self.INITIAL_PROMPT_TEMPLATE)
-
-        while True:
-            print(f"HighLevelAgent: Executing task: {current_task.description}")
-            current_task.status = TaskStatus.in_progress
-
-            # Capture a "before" screenshot.
-            pre_screenshot_path = f"screenshots/{current_task.id}_before.png"
-            self.low_agent.capture_screenshot(pre_screenshot_path)
-
-            # Translate the planning task to a concrete UI action.
-            ui_action = self.medium_agent.run(current_task)
-            if ui_action is None or ui_action.action == "change_subtask":
-                error_info = "No appropriate UI element found; changing subtask."
-                self.memory.append(MemoryEvent(
-                    timestamp=time.time(),
-                    agent="HighLevelAgent",
-                    event="Translation failure/change_subtask",
-                    task_id=current_task.id,
-                    error=error_info
-                ))
-                current_task = self.generate_task(self.NEXT_PROMPT_TEMPLATE, error_info)
-                continue
-
-            # Execute the UI action.
-            execution_result = self.low_agent.run(ui_action)
-            if not execution_result.get("success"):
-                error_info = execution_result.get("error_message", "Unknown execution error.")
-                self.memory.append(MemoryEvent(
-                    timestamp=time.time(),
-                    agent="HighLevelAgent",
-                    event="Execution error",
-                    task_id=current_task.id,
-                    error=error_info
-                ))
-                current_task = self.generate_task(self.NEXT_PROMPT_TEMPLATE, error_info)
-                continue
-
-            # Capture an "after" screenshot.
-            post_screenshot_path = f"screenshots/{current_task.id}_after.png"
-            self.low_agent.capture_screenshot(post_screenshot_path)
-
-            # Evaluate the execution using both screenshots.
-            recommendation = self.low_agent.evaluate_execution(current_task, pre_screenshot_path, post_screenshot_path, self.user_goal)
-            print("HighLevelAgent Observation:", recommendation.observation)
-            self.memory.append(MemoryEvent(
-                timestamp=time.time(),
-                agent="HighLevelAgent",
-                event="Evaluation completed",
-                task_id=current_task.id,
-                observation=recommendation.observation
-            ))
-
-            # Check if the goal is complete.
-            if recommendation.goal_complete:
-                self.memory.append(MemoryEvent(
-                    timestamp=time.time(),
-                    agent="HighLevelAgent",
-                    event="Goal achieved",
-                    task_id=current_task.id
-                ))
-                print("HighLevelAgent: Goal achieved!")
-                break
-
-            # Use any new planning task from the recommendation; otherwise, generate a new task.
-            if recommendation.new_task:
-                current_task = recommendation.new_task
-            else:
-                current_task = self.generate_task(self.NEXT_PROMPT_TEMPLATE, recommendation.observation)
-
-        print("HighLevelAgent: Execution complete.")
 
 # -------------------------
 # URL Determination Helper
