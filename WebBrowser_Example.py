@@ -7,6 +7,7 @@ This implementation demonstrates:
 - MediumLevelAgent: Translates planning tasks into concrete UI actions.
 - LowLevelAgent: Executes UI actions and evaluates outcomes using before and after screenshots.
 A shared memory (a list of MemoryEvent objects) is used to persist events.
+Python: 3.12.4
 """
 
 from __future__ import annotations
